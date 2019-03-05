@@ -1,0 +1,11 @@
+[package]
+name = "fibers_extra"
+version = "0.1.0"
+authors = ["yuuya uezato <yuuya_uezato@dwango.co.jp>"]
+edition = "2018"
+
+[dependencies]
+futures = "*"
+fibers = "*"
+trackable = "*"
+chrono = "*"
