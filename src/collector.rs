@@ -5,14 +5,15 @@ extern crate trackable;
 use futures::{Async, Future, Poll, Stream};
 use std::fmt::{self, Debug};
 
-/// Collector futureに対するpollで返りうるエラーの列挙体
+/// Collector futureに対するpollで返りうるエラーの列挙体。
+///
 /// 以下二種類のエラーがある:
-/// * InnerError(e, vec, stream)
-///     * e = エラー内容
-///     * vec = エラーが発生するまでに獲得した内容
-///     * stream = エラーが発生した段階での残りのストリーム（継続）
-/// * AlreadyFinished
-///     * このCollectorは役目を終えており、pollに何ら意味がないことを表す
+/// * `InnerError(e, vec, stream)`
+///     * `e` = エラー内容
+///     * `vec` = エラーが発生するまでに獲得した内容
+///     * `stream` = エラーが発生した段階での残りのストリーム（継続）
+/// * `AlreadyFinished`
+///     * このCollectorは役目を終えており、pollに何ら意味がないことを表す。
 pub enum CollectorError<E, T, S> {
     InnerError(E, Vec<T>, S),
     AlreadyFinished,
@@ -26,14 +27,15 @@ impl<E, T, S> Debug for CollectorError<E, T, S> {
     }
 }
 
-/// Stream futureを受け取り、全ての値を回収しようとする。
-/// より正確には以下のように振る舞う:
-/// * 全ての値を回収できた場合 ==> Async::Ready(vec)でVecとして値を返す。
-/// * 値を回収している途中 ==> Async::NotReadyを返す。
-/// * 値の回収中にエラーが起きた場合 ==> CollectorError::InnerError(エラー内容, 現在までに計算済みの値, 未回収のstream)を返す。
+/// Streamを受け取り、その全ての値を回収するためのFuture。
 ///
-/// また、Async::Ready(vec) ないし InnerError を返した後は
-/// このCollectorは使用不能となり、poll()された際にはCollectorError::AlreadyFinishedを返す。
+/// 正確には以下のように振る舞う:
+/// * 全ての値を回収できた場合: `Async::Ready(vec)`でVecとして値を返す。
+/// * 値を回収している途中: `Async::NotReady`を返す。
+/// * 値の回収中にエラーが起きた場合: `CollectorError::InnerError(エラー内容, 現在までに計算済みの値, 残りのstream)`を返す。
+///
+/// また、Async::Ready(vec) ないし InnerError を返した後はこのCollectorは使用不能となり、
+/// `poll()`された際に`CollectorError::AlreadyFinished`を返す。
 pub struct Collector<T, S> {
     inner: Vec<T>,     // 現在回収済みの値を蓄える。
     stream: Option<S>, // 処理対象のstream; エラー時にOption::takeを使い実態を返すためにOptionで包んでいる。

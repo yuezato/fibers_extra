@@ -6,7 +6,8 @@ use fibers::sync::mpsc;
 use futures::future::Either;
 use futures::{Async, Future, Poll, Stream};
 
-/// ParallelExecutorで用いる3つの内部状態
+/// ParallelExecutorで用いる3つの内部状態。
+///
 /// + Processing: 通常状態。問題なく処理が進行している。
 /// + NoTasks: 処理対象のstreamのtaskを全てspawn済みである。ただしspawnしたものが終了していない。
 /// + Finished: NoTasksの後に遷移する状態であり、全てのtaskを無事に終えたことを意味する。
@@ -17,27 +18,26 @@ enum InnerState {
     Finished,
 }
 
-/// ParallelExecutorが発生されうる２つのエラーの列挙体
-/// + PollError(error): ParallelExecutorが抱えるstreamそのものをpollした際に生じたエラー
-/// + InnerFutureError(error) ParallelExecutorが抱えるstreamをpollして得たfutureを実行した際に生じたエラー
+/// ParallelExecutorが発生しうる２つのエラーの列挙体。
+///
+/// + `PollError(error)`: `ParallelExecutor`が抱えるstreamそのものをpollした際に生じたエラー
+/// + `InnerFutureError(error)`: `ParallelExecutor`が抱えるstreamをpollして得たfutureを実行した際に生じたエラー
 pub enum ParallelExecutorError<E1, E2> {
     PollError(E1),
     InnerFutureError(E2),
 }
 
-/// ParallelExecutor構造体は、
-/// Stream `stream` から、値vを順次取り出し、
-/// 値からfutureへのmapping関数mapを通して新たなfuture map(v)を作り、
-/// Spawn traitの実体 `handle` を用いて
-/// 並列度 `concurrency` に基づき並列に実行していく。
+/// 与えられたStream `stream` から、値`v`を順次取り出し、
+/// 値からfutureへの射 `map` を通して新たなfuture `map(v)`を作り、
+/// それらを並列度 `concurrency` のもとで実行するための構造体。
 ///
-/// この構造体そのものが futures::stream::Stream となり、
-/// pollを用いたインタフェイスで操作することができる。
+/// この構造体そのものが Stream となり、pollを用いたインタフェイスで操作することができる。
 ///
-/// #並列度 `concurrency` に関する注意
-/// ParallelExecutorは、ある瞬間に最大`concurrency`個の実行結果を持つことを目指している。
+/// # 並列度`concurrency`に関する注意
+/// `ParallelExecutor`は、ある瞬間に最大`concurrency`個の実行結果を持つことを目指している。  
 /// したがって、`concurrency`個のtaskをspawnし、その全ての実行が終了したという状況で、
-/// ParallelExecutor::pollが呼び出されずに値がconsumeされない場合には、残りのtaskをspawnしない。
+/// `ParallelExecutor::poll`が呼び出されずに値がconsumeされない場合には、
+/// 内部streamに対する`poll`を行わない。
 pub struct ParallelExecutor<Handler: fibers::Spawn, T, E, Map, Strm> {
     handle: Handler,
     concurrency: usize,
@@ -73,6 +73,10 @@ where
     Map: FnMut(T1) -> F,
     Strm: Stream<Item = T1, Error = E1>,
 {
+    /// `ParallelExecutor`のコンストラクタ。
+    ///
+    /// `stream`から値を取り出し、これに`map`を適用して得られる`future`たちを、
+    /// `handle`を用いて`concurrency`並列度のもとで順次実行していく。
     pub fn map(
         handle: Handler,
         concurrency: usize,
