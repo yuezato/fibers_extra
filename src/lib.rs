@@ -1,19 +1,11 @@
-#![allow(unused_imports)]
-#![allow(dead_code)]
-
-extern crate chrono;
 extern crate fibers;
 extern crate futures;
 extern crate trackable;
 
-use fibers::executor::ThreadPoolExecutorHandle;
 use fibers::sync::mpsc;
-use fibers::Spawn;
 use futures::future::Either;
 use futures::{Async, Future, Poll, Stream};
 use std::fmt::{self, Debug};
-use std::marker::PhantomData;
-use std::sync::Arc;
 
 /// Stream futureを受け取り、全ての値を回収しようとする。
 /// 全ての値を回収できた場合にはAsync::Ready(vec)でVecとして値を返す。
@@ -22,16 +14,6 @@ pub struct Collector<T, S> {
     inner: Vec<T>,
     stream: Option<S>,
 }
-
-/*
-impl<T, S> Drop for Collector<T, S>
-    where T: std::fmt::Debug
-{
-    fn drop(&mut self) {
-        println!("[Drop] Collector inner = {:?}", self.inner);
-    }
-}
-*/
 
 impl<T, E, S> Collector<T, S>
 where
@@ -226,9 +208,6 @@ However, we should not reach here since we hold the corresponding sender.
                     break;
                 }
                 Err(e2) => {
-                    // このエラーが上がってしまった場合は
-                    // futureの取り出しそのものに失敗しているため。
-                    // retryで回復する余地は多くの場合に存在しないと思われる。
                     return Err(Either::B(e2));
                 }
             }
@@ -337,130 +316,45 @@ mod tests {
             }
         }
     }
-
-    struct V {
-        howlong: u64,
-        generator: Box<Fn() -> U + Send + 'static>,
-        timer: Option<timer::Timeout>, // timerは、このFuture Vが初めてpollされた段階で、`howlong`-millisで動き始める
-    }
-    impl V {
-        pub fn new<T: Fn() -> U + Send + 'static>(howlong: u64, generator: T) -> Self {
-            V {
-                howlong,
-                generator: Box::new(generator),
-                timer: None,
-            }
-        }
-    }
-    impl Future for V {
-        type Item = U;
-        type Error = ();
-
-        fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-            if let Some(ref mut timer) = self.timer {
-                match timer.poll() {
-                    Ok(Async::Ready(_)) => Ok(Async::Ready((self.generator)())),
-                    Ok(Async::NotReady) => Ok(Async::NotReady),
-                    Err(_) => Err(()),
-                }
-            } else {
-                self.timer = Some(timer::timeout(Duration::from_millis(self.howlong)));
-                Ok(Async::NotReady)
-            }
-        }
-    }
-
     #[test]
-    fn handle_errors() -> TestResult {
-        use self::CollectorError::*;
-
-        let mut executor = ThreadPoolExecutor::new().unwrap();
-
-        let task = convert_to_tasks(vec![
-            U::new("A", 1000),
-            U::new("B", 1000),
-            U::err_new("C", 2000),
-            U::new("D", 3000),
-        ]);
-
-        let pr = ParallelExecutor::new(executor.handle(), 4, task);
-
-        let future = Collector::new(pr);
-
-        let result;
-        {
-            result = executor.run_future(future);
-            std::thread::sleep(std::time::Duration::from_millis(3000));
-        }
-
-        // run_future自体は成功する。
-        // run_futureがエラーを返すのは、executorのレベルで何かしら問題があった時である。
-        assert!(result.is_ok());
-
-        // prが抱えている内部のfutureのエラーが無事に取れている。
-        // （内部のfutureではなくpr固有のエラーであれば、Either::Bでアクセスできる）
-        let result = result.unwrap();
-        let mut rest_stream = None;
-        assert!(match result {
-            Err(InnerError(Either::A(errors), mut values, rest)) => {
-                rest_stream = Some(rest);
-                values.sort();
-                let e = &errors[0];
-
-                values == ["A", "B"] && e == "C"
-            }
-            _ => false,
-        });
-
-        let rest_stream = rest_stream.unwrap();
-        let future = Collector::new(rest_stream);
-        let result;
-        {
-            result = executor.run_future(future);
-            std::thread::sleep(std::time::Duration::from_millis(3000));
-        }
-        let result = result.unwrap().unwrap();
-
-        assert_eq!(result, ["D"]);
-
-        Ok(())
-    }
-
-    #[test]
-    fn collector_works() {
+    fn check_concurrency_level1_works() {
         let mut executor = ThreadPoolExecutor::new().unwrap();
         let task = convert_to_tasks(vec![
             U::new("A", 1000),
             U::new("B", 1000),
             U::new("C", 1000),
-            U::new("D", 100),
+            U::new("D", 1000),
         ]);
 
-        let pr = ParallelExecutor::new(executor.handle(), 4, task);
+        let pr = ParallelExecutor::new(executor.handle(), 1, task);
         let future = Collector::new(pr);
-
-        let result = executor.run_future(future);
-
-        let mut vec = result.unwrap().unwrap();
-        vec.sort();
-        assert_eq!(vec, ["A", "B", "C", "D"]);
-    }
-
-    #[test]
-    fn check_concurrency_test1_works() {
-        let mut executor = ThreadPoolExecutor::new().unwrap();
-        let task = convert_to_tasks(vec![
-            U::new("A", 1000),
-            U::new("B", 1000),
-            U::new("C", 1000),
-            U::new("D", 100),
-        ]);
-
-        let pr = ParallelExecutor::new(executor.handle(), 4, task);
 
         let start = std::time::Instant::now();
-        let result = executor.run_future(Box::new(Collector::new(pr)));
-        assert!(result.is_ok());
+        let result = executor.run_future(future);
+        let mut result = result.unwrap().unwrap();
+        result.sort();
+        assert_eq!(result, ["A", "B", "C", "D"]);
+        let end = start.elapsed();
+        let exec_time = end.as_millis();
+        // 5秒以内には終わるだろうという雑な値
+        assert!(4000 <= exec_time && exec_time <= 5000);
+    }
+
+    #[test]
+    fn check_concurrency_level4_works() {
+        let mut executor = ThreadPoolExecutor::new().unwrap();
+        let task = convert_to_tasks(vec![
+            U::new("A", 1000),
+            U::new("B", 1000),
+            U::new("C", 1000),
+            U::new("D", 1000),
+        ]);
+
+        let pr = ParallelExecutor::new(executor.handle(), 4, task);
+        let future = Collector::new(pr);
+
+        let start = std::time::Instant::now();
+        let result = executor.run_future(future);
         let mut result = result.unwrap().unwrap();
         result.sort();
         assert_eq!(result, ["A", "B", "C", "D"]);
@@ -468,6 +362,54 @@ mod tests {
         let exec_time = end.as_millis();
         // 2秒以内には終わるだろうという雑な値
         assert!(1000 <= exec_time && exec_time <= 2000);
+    }
+
+    struct V {
+        howlong: u64,
+        generator: Box<Fn() -> U + Send + 'static>,
+        timer: Option<timer::Timeout>, // timerは、このFuture Vが初めてpollされた段階で、`howlong`-millisで動き始める
+        error: Option<String>,
+    }
+    impl V {
+        pub fn new<T: Fn() -> U + Send + 'static>(howlong: u64, generator: T) -> Self {
+            V {
+                howlong,
+                generator: Box::new(generator),
+                timer: None,
+                error: None,
+            }
+        }
+        pub fn err_new(howlong: u64, msg: &str) -> Self {
+            V {
+                howlong,
+                generator: Box::new(|| U::new("dummy", 0)),
+                timer: None,
+                error: Some(msg.to_owned()),
+            }
+        }
+    }
+    impl Future for V {
+        type Item = U;
+        type Error = String;
+
+        fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+            if let Some(ref mut timer) = self.timer {
+                match timer.poll() {
+                    Ok(Async::Ready(_)) => {
+                        if let Some(err_msg) = &self.error {
+                            Err(err_msg.to_owned())
+                        } else {
+                            Ok(Async::Ready((self.generator)()))
+                        }
+                    }
+                    Ok(Async::NotReady) => Ok(Async::NotReady),
+                    Err(_) => Err("timer.poll".to_owned()),
+                }
+            } else {
+                self.timer = Some(timer::timeout(Duration::from_millis(self.howlong)));
+                Ok(Async::NotReady)
+            }
+        }
     }
 
     /*
@@ -689,6 +631,138 @@ mod tests {
             let exec_time = end.as_millis();
             assert!(12000 <= exec_time && exec_time <= 13000);
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn error_handle_test1() -> TestResult {
+        use self::CollectorError::*;
+
+        let mut executor = ThreadPoolExecutor::new().unwrap();
+
+        let task = convert_to_tasks(vec![
+            U::new("A", 1000),
+            U::new("B", 1000),
+            U::err_new("C", 2000),
+            U::new("D", 3000),
+        ]);
+
+        let pr = ParallelExecutor::new(executor.handle(), 4, task);
+
+        let future = Collector::new(pr);
+
+        let result;
+        {
+            result = executor.run_future(future);
+        }
+
+        // prが抱えている内部のfutureのエラーが無事に取れている。
+        // （内部のfutureではなくpr固有のエラーであれば、Either::Bでアクセスできる）
+        let result = result.unwrap();
+        let mut rest_stream = None;
+        assert!(match result {
+            Err(InnerError(Either::A(errors), mut values, rest)) => {
+                rest_stream = Some(rest);
+                values.sort();
+                let e = &errors[0];
+
+                values == ["A", "B"] && e == "C"
+            }
+            _ => false,
+        });
+
+        let rest_stream = rest_stream.unwrap();
+        let future = Collector::new(rest_stream);
+        let result;
+        {
+            result = executor.run_future(future);
+        }
+        let result = result.unwrap().unwrap();
+
+        assert_eq!(result, ["D"]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn error_handle_test2() -> TestResult {
+        use self::CollectorError::*;
+
+        let mut executor = ThreadPoolExecutor::new().unwrap();
+
+        let task = convert_to_tasks(vec![
+            V::new(1000, || U::new("A", 1000)),
+            V::new(1000, || U::new("B", 1000)),
+            V::new(1000, || U::err_new("C", 500)),
+            V::new(1000, || U::err_new("D", 500)),
+        ]);
+
+        let pr1 = ParallelExecutor::new(executor.handle(), 4, task);
+        let pr2 = ParallelExecutor::new(executor.handle(), 4, pr1);
+
+        let future = Collector::new(pr2);
+
+        let result = executor.run_future(future);
+        let result = result.unwrap();
+        let mut rest_stream = None;
+        assert!(match result {
+            Err(InnerError(Either::A(mut errors), values, rest)) => {
+                rest_stream = Some(rest);
+                errors.sort();
+
+                values.is_empty() && errors == ["C", "D"]
+            }
+            _ => false,
+        });
+
+        let rest_stream = rest_stream.unwrap();
+        let future = Collector::new(rest_stream);
+        let result = executor.run_future(future);
+        let mut result = result.unwrap().unwrap();
+        result.sort();
+
+        assert_eq!(result, ["A", "B"]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn error_handle_test3() -> TestResult {
+        use self::CollectorError::*;
+
+        let mut executor = ThreadPoolExecutor::new().unwrap();
+
+        let task = convert_to_tasks(vec![
+            V::new(1000, || U::new("A", 1000)),
+            V::new(1000, || U::new("B", 1000)),
+            V::err_new(500, "pr1_error"),
+            V::new(1000, || U::new("D", 1000)),
+        ]);
+
+        let pr1 = ParallelExecutor::new(executor.handle(), 4, task); // handle V's
+        let pr2 = ParallelExecutor::new(executor.handle(), 4, pr1); // handle U's generated by V's
+
+        let future = Collector::new(pr2);
+
+        let result = executor.run_future(future);
+        let result = result.unwrap();
+        let mut rest_stream = None;
+        assert!(match result {
+            Err(InnerError(Either::B(Either::A(errors)), _, rest)) => {
+                rest_stream = Some(rest);
+                errors == ["pr1_error"]
+            }
+            _ => false,
+        });
+
+        let rest_stream = rest_stream.unwrap();
+        let future = Collector::new(rest_stream);
+        let result = executor.run_future(future);
+        let mut result = result.unwrap().unwrap();
+        result.sort();
+
+        assert_eq!(result, ["A", "B", "D"]);
 
         Ok(())
     }
