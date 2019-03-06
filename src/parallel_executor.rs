@@ -207,11 +207,40 @@ mod tests {
     use super::*;
     use fibers::time::timer;
     use fibers::{Executor, InPlaceExecutor, ThreadPoolExecutor};
+    use futures::future;
     use std::time::Duration;
     use trackable::result::TestResult;
 
     fn id<Arg>(arg: Arg) -> Arg {
         arg
+    }
+
+    #[test]
+    fn parallel_executor_as_map() -> TestResult {
+        let v: Vec<usize> = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        let stream = futures::stream::iter_ok::<_, ()>(v);
+
+        let mut executor = ThreadPoolExecutor::new().unwrap();
+
+        let pr1 = ParallelExecutor::map(executor.handle(), 1, stream, |x: usize| {
+            future::ok::<usize, ()>(x * x)
+        });
+        let pr2 = ParallelExecutor::map(executor.handle(), 2, pr1, |x: usize| {
+            future::ok::<usize, ()>(x * x)
+        });
+        let pr3 = ParallelExecutor::map(executor.handle(), 4, pr2, |x: usize| {
+            future::ok::<usize, ()>(x * x)
+        });
+        let future = Collector::new(pr3);
+
+        let mut result = executor.run_future(future).unwrap().unwrap();
+        result.sort();
+        assert_eq!(
+            result,
+            vec![1, 256, 6561, 65536, 390625, 1679616, 5764801, 16777216, 43046721, 100000000]
+        );
+
+        Ok(())
     }
 
     fn secs(s: u64) -> Duration {
@@ -220,12 +249,6 @@ mod tests {
 
     fn millis(s: u64) -> Duration {
         Duration::from_millis(s)
-    }
-
-    fn convert_to_tasks<T, E, F: Future<Item = T, Error = E>>(
-        v: Vec<F>,
-    ) -> impl Stream<Item = F, Error = ()> {
-        futures::stream::iter_ok::<_, ()>(v)
     }
 
     // 与えられたduration時刻経過すると
@@ -279,6 +302,12 @@ mod tests {
                 Ok(Async::NotReady)
             }
         }
+    }
+
+    fn convert_to_tasks<T, E, F: Future<Item = T, Error = E>>(
+        v: Vec<F>,
+    ) -> impl Stream<Item = F, Error = ()> {
+        futures::stream::iter_ok::<_, ()>(v)
     }
 
     // 並列度1で、4つのtaskからなるtask streamを実行する。
