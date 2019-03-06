@@ -11,18 +11,19 @@ use fibers::sync::mpsc;
 use fibers::Spawn;
 use futures::future::Either;
 use futures::{Async, Future, Poll, Stream};
+use std::fmt::{self, Debug};
 use std::marker::PhantomData;
 use std::sync::Arc;
-use std::fmt::{self, Debug};
 
 /// Stream futureを受け取り、全ての値を回収しようとする。
 /// 全ての値を回収できた場合にはAsync::Ready(vec)でVecとして値を返す。
 /// 値を回収している途中はAsync::NotReadyを返す。
-pub struct Collector<T: std::fmt::Debug, S> {
+pub struct Collector<T, S> {
     inner: Vec<T>,
     stream: Option<S>,
 }
 
+/*
 impl<T, S> Drop for Collector<T, S>
     where T: std::fmt::Debug
 {
@@ -30,10 +31,11 @@ impl<T, S> Drop for Collector<T, S>
         println!("[Drop] Collector inner = {:?}", self.inner);
     }
 }
+*/
 
 impl<T, E, S> Collector<T, S>
 where
-    T: std::fmt::Debug + Clone,
+    T: Clone,
     S: Stream<Item = T, Error = E>,
 {
     pub fn new(stream: S) -> Self {
@@ -48,15 +50,14 @@ where
     }
 }
 
-pub enum CollectorError<E, S> {
-    InnerError(E, S),
+pub enum CollectorError<E, T: Clone, S> {
+    InnerError(E, Vec<T>, S),
     AlreadyFinished,
 }
-
-impl<E, S> Debug for CollectorError<E, S> {
+impl<E, T: Clone, S> Debug for CollectorError<E, T, S> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
-            CollectorError::InnerError(_, _) => write!(f, "InnerError"),
+            CollectorError::InnerError(_, _, _) => write!(f, "InnerError"),
             CollectorError::AlreadyFinished => write!(f, "AlreadyFinished"),
         }
     }
@@ -64,39 +65,33 @@ impl<E, S> Debug for CollectorError<E, S> {
 
 impl<T, E, S> Future for Collector<T, S>
 where
-    T: std::fmt::Debug + Clone,
+    T: Clone,
     S: Stream<Item = T, Error = E>,
 {
     type Item = Vec<T>;
-    type Error = CollectorError<E, S>;
+    type Error = CollectorError<E, T, S>;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         if self.stream.is_none() {
             return Err(CollectorError::AlreadyFinished);
         }
         let mut stream = self.stream.take().unwrap();
-        
+
         match stream.poll() {
             Ok(Async::Ready(Some(e))) => {
-                println!("ready some");
                 self.stream = Some(stream);
                 self.inner.push(e);
                 Ok(Async::NotReady)
             }
             Ok(Async::Ready(None)) => {
-                println!("ready none");
                 self.stream = Some(stream);
                 Ok(Async::Ready(self.inner.clone()))
             }
             Ok(Async::NotReady) => {
-                println!("not ready");
                 self.stream = Some(stream);
                 Ok(Async::NotReady)
             }
-            Err(e) => {
-                println!("err");
-                Err(CollectorError::InnerError(e, stream))
-            }
+            Err(e) => Err(CollectorError::InnerError(e, self.inner.clone(), stream)),
         }
     }
 }
@@ -153,7 +148,7 @@ where
 impl<H, T, E1, E2, F, Tasks> Stream for ParallelExecutor<H, T, E1, Tasks>
 where
     H: fibers::Spawn,
-    T: std::fmt::Debug + Send + 'static,
+    T: Send + 'static,
     E1: Send + 'static,
     E2: Send + 'static,
     F: Future<Item = T, Error = E1> + Send + 'static,
@@ -204,38 +199,30 @@ However, we should not reach here since we hold the corresponding sender.
             }
         }
 
-        assert!(self.state == InnerState::Processing || self.state == InnerState::ErrorOccurred);
-        
-        while self.state != InnerState::ErrorOccurred && (self.buffer.len() + self.current_spawned) < self.concurrency {
+        while self.state != InnerState::ErrorOccurred
+            && (self.buffer.len() + self.current_spawned) < self.concurrency
+        {
             match self.tasks.poll() {
                 Ok(Async::Ready(Some(future))) => {
-                    println!("tasks reaey some");
                     let tx = self.sender.clone();
-                    let future =
-                        future.then(move |v_or_e| {
-                            match v_or_e {
-                                Ok(v) => {
-                                    println!("ok {:?}", v);
-                                    let _ = tx.send(Either::A(v));
-                                    Ok(())
-                                },
-                                Err(e) => {
-                                    println!("err");
-                                    let _ = tx.send(Either::B(e));
-                                    Err(())
-                                }
-                            }
-                        });
+                    let future = future.then(move |v_or_e| match v_or_e {
+                        Ok(v) => {
+                            let _ = tx.send(Either::A(v));
+                            Ok(())
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Either::B(e));
+                            Err(())
+                        }
+                    });
                     self.handle.spawn(future);
                     self.current_spawned += 1;
                 }
                 Ok(Async::Ready(None)) => {
-                    println!("tasks ready none");
                     self.state = InnerState::NoTasks;
                     break;
                 }
                 Ok(Async::NotReady) => {
-                    println!("tasks notready");
                     break;
                 }
                 Err(e2) => {
@@ -247,13 +234,12 @@ However, we should not reach here since we hold the corresponding sender.
             }
         }
 
-        println!("spawned = {}, state = {:?}", self.current_spawned, self.state);
-
         if self.current_spawned == 0 && self.state == InnerState::ErrorOccurred {
             let errors = std::mem::replace(&mut self.error_buffer, Vec::new());
             self.state = InnerState::Processing;
             return Err(Either::A(errors));
         }
+
         if let Some(v) = self.buffer.pop() {
             Ok(Async::Ready(Some(v)))
         } else if self.current_spawned == 0 && self.state == InnerState::NoTasks {
@@ -268,54 +254,13 @@ However, we should not reach here since we hold the corresponding sender.
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{DateTime, Utc};
     use fibers::time::timer;
     use fibers::{Executor, InPlaceExecutor, Spawn, ThreadPoolExecutor};
+    use std::cmp::PartialEq;
     use std::thread;
     use std::time::{self, Duration};
-    use trackable::result::TestResult;
-    use std::cmp::PartialEq;
     use trackable::error::TestError;
-    
-    #[derive(Clone)]
-    struct S {
-        mem: usize,
-    }
-
-    impl Future for S {
-        type Item = usize;
-        type Error = ();
-
-        fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-            Ok(Async::Ready(self.mem))
-        }
-    }
-
-    impl Drop for S {
-        fn drop(&mut self) {
-            println!("drop S [ mem = {} ]", self.mem);
-        }
-    }
-
-    struct I {
-        s: S,
-    }
-
-    impl Future for I {
-        type Item = S;
-        type Error = ();
-
-        fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-            let s = self.s.clone();
-            Ok(Async::Ready(s))
-        }
-    }
-
-    impl Drop for I {
-        fn drop(&mut self) {
-            println!("drop I [ s.mem = {} ]", self.s.mem);
-        }
-    }
+    use trackable::result::TestResult;
 
     struct VecWrap<T> {
         inner: Vec<T>,
@@ -337,49 +282,12 @@ mod tests {
         }
     }
 
-    impl<T> Drop for VecWrap<T> {
-        fn drop(&mut self) {
-            println!("VecWrap drop");
-        }
-    }
-
-    fn make_tasks(v: Vec<usize>) -> impl Stream<Item = Box<S>, Error = ()> {
-        let sv = v.iter().map(|e| Box::new(S { mem: *e })).collect();
-        VecWrap { inner: sv }
-    }
-
-    fn make_tasks2(v: Vec<usize>) -> impl Stream<Item = Box<I>, Error = ()> {
-        let sv = v.iter().map(|e| Box::new(I { s: S { mem: *e } })).collect();
-        VecWrap { inner: sv }
-    }
-
     fn convert_to_tasks<T, E, F: Future<Item = T, Error = E>>(
         v: Vec<F>,
     ) -> impl Stream<Item = Box<F>, Error = ()> {
-        let v = v.into_iter().map(|e| Box::new(e)).collect();
+        let v = v.into_iter().map(Box::new).collect();
         VecWrap { inner: v }
     }
-
-    /*
-    #[test]
-    fn it_works() {
-        let mut executor = ThreadPoolExecutor::new().unwrap();
-        let tasks = make_tasks(vec![1, 2, 3]);
-
-        let mut par1 = ParallelExecutor::new(
-            executor.handle(),
-            1,
-            make_tasks2(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]),
-        );
-        let mut par2 = ParallelExecutor::new(executor.handle(), 10, par1);
-
-        println!("start");
-
-        executor.run_future(par2.into_future());
-
-        println!("finish");
-    }
-     */
 
     struct U {
         inner: String,
@@ -424,8 +332,6 @@ mod tests {
                     Err(_) => unreachable!("In this test module, we should not reach here"),
                 }
             } else {
-                let now: DateTime<Utc> = Utc::now();
-                println!("[U] UTC now is: {}", now);
                 self.timer = Some(timer::timeout(Duration::from_millis(self.howlong)));
                 Ok(Async::NotReady)
             }
@@ -434,11 +340,11 @@ mod tests {
 
     struct V {
         howlong: u64,
-        generator: Box<Fn() -> U>,
+        generator: Box<Fn() -> U + Send + 'static>,
         timer: Option<timer::Timeout>, // timerは、このFuture Vが初めてpollされた段階で、`howlong`-millisで動き始める
     }
     impl V {
-        pub fn new<T: Fn() -> U + 'static>(howlong: u64, generator: T) -> Self {
+        pub fn new<T: Fn() -> U + Send + 'static>(howlong: u64, generator: T) -> Self {
             V {
                 howlong,
                 generator: Box::new(generator),
@@ -455,14 +361,9 @@ mod tests {
                 match timer.poll() {
                     Ok(Async::Ready(_)) => Ok(Async::Ready((self.generator)())),
                     Ok(Async::NotReady) => Ok(Async::NotReady),
-                    Err(e) => {
-                        dbg!(e);
-                        Err(())
-                    }
+                    Err(_) => Err(()),
                 }
             } else {
-                let now: DateTime<Utc> = Utc::now();
-                println!("[V] UTC now is: {}", now);
                 self.timer = Some(timer::timeout(Duration::from_millis(self.howlong)));
                 Ok(Async::NotReady)
             }
@@ -472,7 +373,7 @@ mod tests {
     #[test]
     fn handle_errors() -> TestResult {
         use self::CollectorError::*;
-        
+
         let mut executor = ThreadPoolExecutor::new().unwrap();
 
         let task = convert_to_tasks(vec![
@@ -484,59 +385,49 @@ mod tests {
 
         let pr = ParallelExecutor::new(executor.handle(), 4, task);
 
-        // 先に future そのものがdropしてしまうと
-        // もしかしたらヤバイのではないか……
         let future = Collector::new(pr);
 
         let result;
-        println!("start");
         {
             result = executor.run_future(future);
-            println!("finish");
             std::thread::sleep(std::time::Duration::from_millis(3000));
         }
-        println!("true finish");
-        
+
         // run_future自体は成功する。
         // run_futureがエラーを返すのは、executorのレベルで何かしら問題があった時である。
-        assert!(result.is_ok()); 
+        assert!(result.is_ok());
 
         // prが抱えている内部のfutureのエラーが無事に取れている。
         // （内部のfutureではなくpr固有のエラーであれば、Either::Bでアクセスできる）
         let result = result.unwrap();
         let mut rest_stream = None;
-        assert!(
-            match result {
-                Err(InnerError(Either::A(errors), rest)) => {
-                    rest_stream = Some(rest);
-                    let e = &errors[0];
-                    e == "C"
-                },
-                _ => false,
+        assert!(match result {
+            Err(InnerError(Either::A(errors), mut values, rest)) => {
+                rest_stream = Some(rest);
+                values.sort();
+                let e = &errors[0];
+
+                values == ["A", "B"] && e == "C"
             }
-        );
+            _ => false,
+        });
 
         let rest_stream = rest_stream.unwrap();
         let future = Collector::new(rest_stream);
         let result;
-        println!("start");
         {
-            // ここで固まるのはなぜ？
-            // stream的にはfinishしているハズだが
-            // spawn中だと誤認してしまっている
             result = executor.run_future(future);
-            println!("finish");
             std::thread::sleep(std::time::Duration::from_millis(3000));
         }
-        println!("true finish");
         let result = result.unwrap().unwrap();
-        dbg!(result);
-        
+
+        assert_eq!(result, ["D"]);
+
         Ok(())
     }
-/*    
+
     #[test]
-    fn poll_finished_stream() {
+    fn collector_works() {
         let mut executor = ThreadPoolExecutor::new().unwrap();
         let task = convert_to_tasks(vec![
             U::new("A", 1000),
@@ -549,7 +440,10 @@ mod tests {
         let future = Collector::new(pr);
 
         let result = executor.run_future(future);
-        dbg!(result);
+
+        let mut vec = result.unwrap().unwrap();
+        vec.sort();
+        assert_eq!(vec, ["A", "B", "C", "D"]);
     }
 
     #[test]
@@ -599,10 +493,10 @@ mod tests {
              */
 
             let task = convert_to_tasks(vec![
-                V::new(1000, ("A", 1000)),
-                V::new(1000, ("B", 1000)),
-                V::new(1000, ("C", 1000)),
-                V::new(1000, ("D", 1000)),
+                V::new(1000, || U::new("A", 1000)),
+                V::new(1000, || U::new("B", 1000)),
+                V::new(1000, || U::new("C", 1000)),
+                V::new(1000, || U::new("D", 1000)),
             ]);
 
             let pr1 = ParallelExecutor::new(executor.handle(), 4, task);
@@ -639,10 +533,10 @@ mod tests {
              */
 
             let task = convert_to_tasks(vec![
-                V::new(1000, ("A", 1000)),
-                V::new(1000, ("B", 1000)),
-                V::new(1000, ("C", 1000)),
-                V::new(1000, ("D", 1000)),
+                V::new(1000, || U::new("A", 1000)),
+                V::new(1000, || U::new("B", 1000)),
+                V::new(1000, || U::new("C", 1000)),
+                V::new(1000, || U::new("D", 1000)),
             ]);
 
             let pr1 = ParallelExecutor::new(executor.handle(), 4, task);
@@ -680,12 +574,12 @@ mod tests {
              */
 
             let task = convert_to_tasks(vec![
-                V::new(1000, ("A", 1000)),
-                V::new(1000, ("B", 1000)),
-                V::new(1000, ("C", 1000)),
-                V::new(1000, ("D", 1000)),
-                V::new(1000, ("E", 1000)),
-                V::new(1000, ("F", 1000)),
+                V::new(1000, || U::new("A", 1000)),
+                V::new(1000, || U::new("B", 1000)),
+                V::new(1000, || U::new("C", 1000)),
+                V::new(1000, || U::new("D", 1000)),
+                V::new(1000, || U::new("E", 1000)),
+                V::new(1000, || U::new("F", 1000)),
             ]);
 
             let pr1 = ParallelExecutor::new(executor.handle(), 4, task);
@@ -698,7 +592,6 @@ mod tests {
             result.sort();
             assert_eq!(result, ["A", "B", "C", "D", "E", "F"]);
             let end = start.elapsed();
-            dbg!(&end);
             let exec_time = end.as_millis();
             assert!(4000 <= exec_time && exec_time <= 5000);
         }
@@ -731,9 +624,9 @@ mod tests {
              */
 
             let task = convert_to_tasks(vec![
-                V::new(1000, ("A", 3000)),
-                V::new(1000, ("B", 3000)),
-                V::new(1000, ("C", 3000)),
+                V::new(1000, || U::new("A", 3000)),
+                V::new(1000, || U::new("B", 3000)),
+                V::new(1000, || U::new("C", 3000)),
             ]);
 
             let pr1 = ParallelExecutor::new(executor.handle(), 1, task);
@@ -746,7 +639,6 @@ mod tests {
             result.sort();
             assert_eq!(result, ["A", "B", "C"]);
             let end = start.elapsed();
-            dbg!(&end);
             let exec_time = end.as_millis();
             assert!(12000 <= exec_time && exec_time <= 13000);
         }
@@ -779,9 +671,9 @@ mod tests {
              */
 
             let task = convert_to_tasks(vec![
-                V::new(1000, ("A", 3000)),
-                V::new(1000, ("B", 3000)),
-                V::new(1000, ("C", 3000)),
+                V::new(1000, || U::new("A", 3000)),
+                V::new(1000, || U::new("B", 3000)),
+                V::new(1000, || U::new("C", 3000)),
             ]);
 
             let pr1 = ParallelExecutor::new(executor.handle(), 1, task);
@@ -794,12 +686,10 @@ mod tests {
             result.sort();
             assert_eq!(result, ["A", "B", "C"]);
             let end = start.elapsed();
-            dbg!(&end);
             let exec_time = end.as_millis();
             assert!(12000 <= exec_time && exec_time <= 13000);
         }
 
         Ok(())
     }
-     */
 }
