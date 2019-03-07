@@ -9,8 +9,8 @@ use futures::{Async, Future, Poll, Stream};
 /// ParallelExecutorで用いる3つの内部状態。
 ///
 /// + Processing: 通常状態。問題なく処理が進行している。
-/// + NoTasks: 処理対象のstreamのtaskを全てspawn済みである。ただしspawnしたものが終了していない。
-/// + Finished: NoTasksの後に遷移する状態であり、全てのtaskを無事に終えたことを意味する。
+/// + NoTasks: 処理対象のstreamから値を全て取得してspawn済みである。ただしspawnしたが終了していないものがある。
+/// + Finished: NoTasksの後に遷移する状態であり、spawn済みのfutureたちから値を回収しきったことを意味する。
 #[derive(PartialEq, Debug)]
 enum InnerState {
     Progress,
@@ -35,7 +35,7 @@ pub enum ParallelExecutorError<E1, E2> {
 ///
 /// # 並列度`concurrency`に関する注意
 /// `ParallelExecutor`は、ある瞬間に最大`concurrency`個の実行結果を持つことを目指している。  
-/// したがって、`concurrency`個のtaskをspawnし、その全ての実行が終了したという状況で、
+/// したがって、`concurrency`個のfuturekをspawnし、その全ての実行が終了したという状況で、
 /// `ParallelExecutor::poll`が呼び出されずに値がconsumeされない場合には、
 /// 内部streamに対する`poll`を行わない。
 pub struct ParallelExecutor<Handler: fibers::Spawn, T, E, Map, Strm> {
@@ -49,7 +49,7 @@ pub struct ParallelExecutor<Handler: fibers::Spawn, T, E, Map, Strm> {
     // 0 <= spawned_futures < concurrencyを満たす
     spawned_futures: usize,
 
-    // spawn済みのtaskとの間でやり取りするためのchannel
+    // spawn済みのfutureとの間でやり取りするためのchannel
     // T=futureの正常値の型; E=futureのエラーの型
     sender: mpsc::Sender<Either<T, E>>,
     receiver: mpsc::Receiver<Either<T, E>>,
@@ -98,8 +98,7 @@ where
     }
 }
 
-impl<Handler, T1, E1, T2, E2, F, Map, Tasks> Stream
-    for ParallelExecutor<Handler, T2, E2, Map, Tasks>
+impl<Handler, T1, E1, T2, E2, F, Map, Strm> Stream for ParallelExecutor<Handler, T2, E2, Map, Strm>
 where
     Handler: fibers::Spawn,
     T1: Send + 'static,
@@ -108,7 +107,7 @@ where
     E2: Send + 'static,
     F: Future<Item = T2, Error = E2> + Send + 'static,
     Map: FnMut(T1) -> F,
-    Tasks: Stream<Item = T1, Error = E1>,
+    Strm: Stream<Item = T1, Error = E1>,
 {
     type Item = T2;
     type Error = ParallelExecutorError<E1, E2>;
@@ -119,7 +118,7 @@ where
         }
 
         loop {
-            // spawn済みtaskからの返信処理
+            // spawn済みfutureからの返信処理
             match self.receiver.poll() {
                 Ok(Async::Ready(Some(v_or_e))) => {
                     self.spawned_futures -= 1;
@@ -155,7 +154,7 @@ However, we should not reach here since we hold the corresponding sender.
         {
             match self.stream.poll() {
                 Ok(Async::Ready(Some(value))) => {
-                    // stream taskからのtask取り出しに成功した場合
+                    // streamからの値の取り出しに成功した場合
                     let tx = self.sender.clone();
                     // TODO: 本来であればspawnした先でfutureを作った方が良い
                     let future = (self.map)(value);
@@ -173,16 +172,16 @@ However, we should not reach here since we hold the corresponding sender.
                     self.spawned_futures += 1;
                 }
                 Ok(Async::Ready(None)) => {
-                    // 全てのtaskを取り出し終わっている場合
+                    // 全ての値を取り出し終わっている場合
                     self.state = InnerState::NoTasks;
                     break;
                 }
                 Ok(Async::NotReady) => {
-                    // 取り出せるtaskがない場合
+                    // 取り出せる値がない場合
                     break;
                 }
                 Err(e2) => {
-                    // task stream側でtaskの生成時にエラーが生じた場合
+                    // stream側で値の生成時にエラーが生じた場合
                     return Err(ParallelExecutorError::PollError(e2));
                 }
             }
